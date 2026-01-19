@@ -5,18 +5,19 @@ import {
   Plus, Trash2, ChevronLeft, ChevronRight, Shield, GraduationCap, LayoutDashboard, 
   ThumbsUp, Vote, Send, Users, Settings, ListOrdered, Lock, Unlock, Languages, Ban, 
   Zap, HelpCircle, AlertCircle, Download, Upload, Database, LogOut, LogIn, Activity,
-  AlertOctagon, Monitor
+  AlertOctagon
 } from 'lucide-react';
 
 // Firebase imports
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged, signInAnonymously } from 'firebase/auth';
+import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
 import { 
   getFirestore, 
   doc, 
   onSnapshot, 
   setDoc, 
   updateDoc, 
+  increment, 
   getDoc,
   collection,
   arrayUnion,
@@ -25,9 +26,7 @@ import {
   serverTimestamp,
   query,
   orderBy,
-  limit,
-  getDocs,
-  writeBatch
+  limit
 } from 'firebase/firestore';
 
 // --- Firebase Configuration & Initialization ---
@@ -145,15 +144,13 @@ const App = () => {
   const [failedAttempts, setFailedAttempts] = useState(0);
   const [isLockedOut, setIsLockedOut] = useState(false);
 
-  // Force Login & Session State
+  // Force Login State
   const [forceLoginPassword, setForceLoginPassword] = useState('');
   const [conflictIP, setConflictIP] = useState('');
   const [clientIP, setClientIP] = useState('');
   const [sessionId, setSessionId] = useState('');
-  const [currentLogId, setCurrentLogId] = useState(null); 
   const [loginLogs, setLoginLogs] = useState([]);
-  const [pendingLoginIp, setPendingLoginIp] = useState('');
-  const [pendingOldSessionData, setPendingOldSessionData] = useState(null); 
+  const [pendingLoginIp, setPendingLoginIp] = useState(''); // Store IP for force login
 
   // Editor State
   const [visualChoices, setVisualChoices] = useState([]); 
@@ -176,8 +173,10 @@ const App = () => {
 
   // --- Initial Setup ---
   useEffect(() => {
+    // Generate session ID
     setSessionId(Math.random().toString(36).substring(2, 15));
-    // Initial fetch, though real fetch happens on arrow click
+    
+    // Fetch IP (Initial) - Fail safe
     fetch('https://api.ipify.org?format=json')
       .then(res => res.json())
       .then(data => setClientIP(data.ip))
@@ -188,7 +187,9 @@ const App = () => {
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       if (user) {
+        // Logged in
         setCurrentUser(user);
+        
         const email = user.email;
         if (email && USER_MAPPING[email] === 'TEACHER') {
           setUserRole('TEACHER');
@@ -196,15 +197,19 @@ const App = () => {
           setLoginError('');
           fetchData();
         } else {
+          // 如果不是老師，且目前是匿名登入狀態，檢查是否有指定的學生身份
           if (user.isAnonymous && userRole && userRole !== 'TEACHER') {
+             // 這是學生透過選單登入的流程，保持狀態
              setViewMode('student');
              fetchData();
           } else if (!user.isAnonymous) {
+             // 誤用 Google 登入但非老師
              setLoginError('非授權的教師帳號。學生請使用下方「學生專用通道」登入。');
              signOut(auth);
           }
         }
       } else {
+        // Not logged in
         setCurrentUser(null);
       }
     });
@@ -254,12 +259,10 @@ const App = () => {
       const unsubSession = onSnapshot(sessionDocRef, (docSnap) => {
         if (docSnap.exists()) {
           const data = docSnap.data();
-          if (data.sessionId === sessionId) {
-             if (data.logDocId) setCurrentLogId(data.logDocId);
-          }
-          else if (data.sessionId && data.sessionId !== sessionId) {
+          // If the session ID in DB doesn't match MY session ID, I've been kicked
+          if (data.sessionId && data.sessionId !== sessionId) {
             alert(`偵測到重複登入或已強制登出！\n\n您的帳號已在其他裝置 (IP: ${data.ip}) 登入。`);
-            handleLogout(true); 
+            handleLogout();
           }
         }
       });
@@ -269,38 +272,18 @@ const App = () => {
 
   // --- Logic Handlers ---
 
-  const getDeviceInfo = () => {
-    const ua = navigator.userAgent;
-    let os = "Unknown OS";
-    if (ua.indexOf("Win") !== -1) os = "Windows";
-    if (ua.indexOf("Mac") !== -1) os = "MacOS";
-    if (ua.indexOf("Linux") !== -1) os = "Linux";
-    if (ua.indexOf("Android") !== -1) os = "Android";
-    if (ua.indexOf("like Mac") !== -1) os = "iOS";
-    
-    let browser = "Browser";
-    if (ua.indexOf("Chrome") !== -1) browser = "Chrome";
-    else if (ua.indexOf("Safari") !== -1) browser = "Safari";
-    else if (ua.indexOf("Firefox") !== -1) browser = "Firefox";
-    
-    return `${os} / ${browser}`;
-  }
-
   const logActivity = async (seatNo, message, ip) => {
-    if (!db) return null;
+    if (!db) return;
     try {
-      const docRef = await addDoc(collection(db, 'artifacts', APP_ID, 'public', 'data', 'loginLogs'), {
+      await addDoc(collection(db, 'artifacts', APP_ID, 'public', 'data', 'loginLogs'), {
         timestamp: serverTimestamp(),
         seatNo: seatNo,
         name: getStudentNameLabel(seatNo),
         ip: ip || 'Unknown',
-        device: getDeviceInfo(),
         message: message
       });
-      return docRef.id; 
     } catch (e) {
       console.error("Log error", e);
-      return null;
     }
   };
 
@@ -319,32 +302,39 @@ const App = () => {
       setLoginError('請先選擇您的座號！');
       return;
     }
+    
     setLoading(true);
     setLoginError('');
     
     try {
+      // 1. Fetch IP on demand
       let currentIp = 'Unknown';
       try {
         const ipRes = await fetch('https://api.ipify.org?format=json');
         const ipData = await ipRes.json();
         currentIp = ipData.ip;
         setClientIP(currentIp); 
-      } catch (err) {}
+      } catch (err) {
+        console.warn("IP Fetch Failed", err);
+      }
 
+      // 2. Check Session Conflict
       const sessionRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'activeSessions', selectedLoginSeat);
       const sessionSnap = await getDoc(sessionRef);
 
       if (sessionSnap.exists()) {
         const sessionData = sessionSnap.data();
-        if (true) { 
-           setConflictIP(sessionData.ip || 'Unknown');
-           setPendingLoginIp(currentIp);
-           setPendingOldSessionData(sessionData); 
-           setShowForceLoginModal(true); 
-           setLoading(false);
-           return;
-        }
+        
+        // 只要有 session 紀錄，就視為衝突 (嚴格模式)
+        // 除非 session ID 相同 (自己重新整理，這種情況通常不會進入此函式，因為會直接 auto login)
+        setConflictIP(sessionData.ip || 'Unknown');
+        setPendingLoginIp(currentIp); // Store for later
+        setShowForceLoginModal(true); 
+        setLoading(false);
+        return;
       }
+
+      // No conflict, proceed
       await performLogin(selectedLoginSeat, "登入成功", currentIp);
 
     } catch (error) {
@@ -354,27 +344,19 @@ const App = () => {
     }
   };
 
-  const performLogin = async (seatNo, logMessage, ip, oldSessionData = null) => {
+  const performLogin = async (seatNo, logMessage, ip) => {
     try {
-       if (oldSessionData && oldSessionData.logDocId) {
-          const oldLogRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'loginLogs', oldSessionData.logDocId);
-          await setDoc(oldLogRef, { forcedOut: true, message: "登入成功 (後遭強制登出)" }, { merge: true });
-       }
-
        setUserRole(seatNo);
        setCurrentVoter(seatNo);
-
-       const newLogId = await logActivity(seatNo, logMessage, ip || clientIP);
-       setCurrentLogId(newLogId); 
 
        const sessionRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'activeSessions', seatNo);
        await setDoc(sessionRef, {
          ip: ip || clientIP,
          sessionId: sessionId,
-         timestamp: serverTimestamp(),
-         logDocId: newLogId 
+         timestamp: serverTimestamp()
        });
 
+       await logActivity(seatNo, logMessage, ip || clientIP);
        await signInAnonymously(auth);
        
        setShowForceLoginModal(false);
@@ -387,6 +369,7 @@ const App = () => {
     }
   };
 
+  // 清除舊投票紀錄 (Wipe)
   const clearPreviousVotes = async (seatNo) => {
     if (!db) return;
     const docRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'voteDetails', 'global');
@@ -396,15 +379,23 @@ const App = () => {
         const data = docSnap.data();
         const updates = {};
         let needsUpdate = false;
+        
+        // Iterate all positions and candidates
         Object.keys(data).forEach(key => {
           if (Array.isArray(data[key]) && data[key].includes(seatNo)) {
+            // Remove this seatNo from the array
             updates[key] = data[key].filter(id => id !== seatNo);
             needsUpdate = true;
           }
         });
-        if (needsUpdate) await updateDoc(docRef, updates);
+        
+        if (needsUpdate) {
+          await updateDoc(docRef, updates);
+        }
       }
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      console.error("Error clearing previous votes:", e);
+    }
   };
 
   const handleForceLogin = async () => {
@@ -412,18 +403,15 @@ const App = () => {
       alert("密碼錯誤！請通知老師。");
       return;
     }
+    
+    // 1. Wipe previous votes (Override)
     await clearPreviousVotes(selectedLoginSeat);
-    await performLogin(selectedLoginSeat, "強制登入 (發現重複)", pendingLoginIp, pendingOldSessionData);
+
+    // 2. Perform Login (Kick old session)
+    await performLogin(selectedLoginSeat, "發現重複登入，老師已強制重置並覆寫投票", pendingLoginIp);
   };
 
-  const handleLogout = async (isForced = false) => {
-    if (!isForced && currentLogId && db) {
-       try {
-         const myLogRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'loginLogs', currentLogId);
-         await setDoc(myLogRef, { message: "登入成功 (已登出)" }, { merge: true });
-       } catch (e) { console.error("Log update failed", e); }
-    }
-
+  const handleLogout = async () => {
     if (currentVoter && db) {
       try {
         const sessionRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'activeSessions', currentVoter);
@@ -438,61 +426,27 @@ const App = () => {
     setUserRole(null);
     setViewMode('login');
     setSelectedLoginSeat(""); 
-    setCurrentLogId(null);
     setMissingCodes([]);
   };
 
-  const handleClearAllLogs = async () => {
-    if (!confirm("確定要清除所有登入紀錄嗎？此動作無法復原。")) return;
-    try {
-      const q = query(collection(db, 'artifacts', APP_ID, 'public', 'data', 'loginLogs'));
-      const snapshot = await getDocs(q);
-      const batch = writeBatch(db);
-      snapshot.docs.forEach((doc) => {
-        batch.delete(doc.ref);
-      });
-      await batch.commit();
-      alert("已清除所有登入紀錄！");
-    } catch (e) {
-      console.error("Clear logs failed", e);
-      alert("清除失敗");
-    }
-  };
-  
-  // NEW: Handle Clear Votes
-  const handleClearVotes = async () => {
-    if (!db || !currentUser || viewMode !== 'teacher') return;
-    
-    const electionId = filterDate ? filterDate.replace(/-/g, '') : 'UnknownDate';
-    
-    if (!confirm(`⚠️ 危險動作！\n\n您確定要清除「選舉編號：${electionId}」的所有投票與當選紀錄嗎？\n\n這將會：\n1. 清空所有學生的投票\n2. 取消所有當選狀態\n3. 此動作無法復原！\n\n(這通常用於「清除測試資料」以開始正式選舉)`)) {
-      return;
-    }
-
-    try {
-      // 1. Reset Vote Details
-      await setDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'voteDetails', 'global'), {});
-      
-      // 2. Reset Election State
-      await setDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'electionState', 'global'), {});
-      
-      // Log it
-      await logActivity('TEACHER', `已清除投票紀錄 (ElectionID: ${electionId})`, 'System');
-
-      alert(`已成功清除所有資料！\n選舉編號 ${electionId} 現在已重置。`);
-    } catch (e) {
-      console.error("Clear votes error:", e);
-      alert("清除失敗，請檢查網路或權限。");
-    }
-  };
-
-  // ... (Other handlers unchanged) ...
   const handleExportData = () => {
-    const dataToExport = { voteRecords, electionState, timestamp: new Date().toISOString(), systemVersion: '2.0' };
+    const dataToExport = {
+      voteRecords,
+      electionState,
+      timestamp: new Date().toISOString(),
+      systemVersion: '2.0'
+    };
     const blob = new Blob([JSON.stringify(dataToExport, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = `voting_backup_${new Date().toISOString().slice(0,10)}.json`; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `voting_backup_${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
+
   const triggerImport = () => { if (fileInputRef.current) fileInputRef.current.click(); };
   const handleImportData = (event) => {
     const file = event.target.files[0];
@@ -501,10 +455,15 @@ const App = () => {
     reader.onload = async (e) => {
       try {
         const importedData = JSON.parse(e.target.result);
-        if (!importedData.voteRecords || !importedData.electionState) { alert('錯誤：檔案格式不正確。'); return; }
+        if (!importedData.voteRecords || !importedData.electionState) {
+          alert('錯誤：檔案格式不正確。');
+          return;
+        }
         if (confirm('確定要匯入此資料嗎？這將覆蓋目前所有紀錄。')) {
-          await setDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'voteDetails', 'global'), importedData.voteRecords);
-          await setDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'electionState', 'global'), importedData.electionState);
+          const votesRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'voteDetails', 'global');
+          await setDoc(votesRef, importedData.voteRecords);
+          const electionRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'electionState', 'global');
+          await setDoc(electionRef, importedData.electionState);
           alert('資料匯入成功！');
         }
       } catch (err) { alert('匯入失敗。'); }
@@ -513,7 +472,34 @@ const App = () => {
     reader.readAsText(file);
   };
 
-  // ... (useEffect Logic) ...
+  const handleAutoAssign = async () => {
+    if (!db || !currentUser || viewMode !== 'teacher') return;
+    const electionRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'electionState', 'global');
+    const newSelected = { ...electionState.selected };
+    
+    Object.keys(POSITION_MAP).forEach(posCode => {
+      const code = String(posCode);
+      const quota = (code === '1' || code === '2') ? 1 : 2; 
+      const p1Candidates = statistics[code]?.[1] || [];
+      const availableCandidates = p1Candidates.filter(seat => !newSelected[seat]);
+      
+      if (availableCandidates.length > 0 && availableCandidates.length <= quota) {
+        availableCandidates.forEach(seat => {
+          newSelected[seat] = code;
+        });
+      }
+    });
+
+    try {
+      await setDoc(electionRef, { selected: newSelected }, { merge: true });
+      alert("第一輪自動錄取完成！");
+    } catch (e) {
+      console.error("Auto assign error:", e);
+      alert("自動錄取失敗");
+    }
+  };
+
+  // Student Auto Check
   useEffect(() => {
     if (viewMode === 'student' && currentVoter && !hasSubmitted) {
       const newDrafts = { ...draftVotes };
@@ -524,6 +510,7 @@ const App = () => {
         let electedCount = 0;
         Object.values(electionState.selected || {}).forEach(pos => { if (pos === code) electedCount++; });
         if (electedCount >= quota) return; 
+
         const p1 = statistics[code]?.[1] || [];
         const p2 = statistics[code]?.[2] || [];
         const p3 = statistics[code]?.[3] || [];
@@ -531,29 +518,43 @@ const App = () => {
         const p2Count = p2.length;
         const isP2Active = p1Count < candidateLimit;
         const isP3Active = (p1Count + p2Count) < candidateLimit;
+
         let validCandidates = [];
         if (true) validCandidates = [...validCandidates, ...p1]; 
         if (isP2Active) validCandidates = [...validCandidates, ...p2];
         if (isP3Active) validCandidates = [...validCandidates, ...p3];
         const actuallyAvailable = validCandidates.filter(seat => !electionState.selected?.[seat]);
+
         if (actuallyAvailable.length === 1) {
           const candidate = actuallyAvailable[0];
-          if (newDrafts[code] !== candidate) { newDrafts[code] = candidate; hasChanges = true; }
+          if (newDrafts[code] !== candidate) {
+            newDrafts[code] = candidate;
+            hasChanges = true;
+          }
         }
       });
       if (hasChanges) setDraftVotes(newDrafts);
     }
   }, [viewMode, currentVoter, statistics, electionState, candidateLimit]); 
+
   const handleToggleDraftVote = (posCode, seatNo) => {
     if (viewMode !== 'student' || hasSubmitted) return; 
     setDraftVotes(prev => {
       const currentSelection = prev[posCode];
-      if (currentSelection === seatNo) { const newState = { ...prev }; delete newState[posCode]; return newState; }
+      if (currentSelection === seatNo) {
+        const newState = { ...prev };
+        delete newState[posCode];
+        return newState;
+      }
       return { ...prev, [posCode]: seatNo };
     });
   };
+
   const handleValidateAndSubmit = () => {
-    if (!currentVoter) { alert("請先選擇您的座號！"); return; }
+    if (!currentVoter) {
+      alert("請先選擇您的座號！");
+      return;
+    }
     const missing = [];
     const missingCodeList = [];
     Object.keys(POSITION_MAP).forEach(posCode => {
@@ -562,6 +563,7 @@ const App = () => {
       let electedCount = 0;
       Object.values(electionState.selected || {}).forEach(pos => { if (pos === code) electedCount++; });
       if (electedCount >= quota) return; 
+
       const p1 = statistics[code]?.[1] || [];
       const p2 = statistics[code]?.[2] || [];
       const p3 = statistics[code]?.[3] || [];
@@ -569,16 +571,30 @@ const App = () => {
       const p2Count = p2.length;
       const isP2Active = p1Count < candidateLimit;
       const isP3Active = (p1Count + p2Count) < candidateLimit;
+      
       let hasVoteableCandidates = false;
       const checkCandidates = (list) => list.some(seat => !electionState.selected?.[seat]);
+
       if (checkCandidates(p1)) hasVoteableCandidates = true;
       if (isP2Active && checkCandidates(p2)) hasVoteableCandidates = true;
       if (isP3Active && checkCandidates(p3)) hasVoteableCandidates = true;
-      if (hasVoteableCandidates && !draftVotes[code]) { missing.push(POSITION_MAP[code]); missingCodeList.push(code); }
+
+      if (hasVoteableCandidates && !draftVotes[code]) {
+        missing.push(POSITION_MAP[code]);
+        missingCodeList.push(code);
+      }
     });
-    if (missing.length > 0) { setMissingPositions(missing); setMissingCodes(missingCodeList); setShowIncompleteModal(true); } 
-    else { setMissingCodes([]); setShowConfirmModal(true); }
+
+    if (missing.length > 0) {
+      setMissingPositions(missing);
+      setMissingCodes(missingCodeList); 
+      setShowIncompleteModal(true);
+    } else {
+      setMissingCodes([]);
+      setShowConfirmModal(true);
+    }
   };
+
   const confirmSubmit = async () => {
     setShowConfirmModal(false);
     setIsSubmitting(true);
@@ -589,20 +605,61 @@ const App = () => {
         const key = `${posCode}_${seatNo}`;
         updates[key] = arrayUnion(currentVoter); 
       });
-      if (Object.keys(updates).length > 0) await setDoc(docRef, updates, { merge: true });
-      await logActivity(currentVoter, "已完成票選", clientIP); // update log
+      if (Object.keys(updates).length > 0) {
+        await setDoc(docRef, updates, { merge: true });
+      }
+      
+      let currentIp = 'Unknown';
+      try {
+        const ipRes = await fetch('https://api.ipify.org?format=json');
+        const ipData = await ipRes.json();
+        currentIp = ipData.ip;
+      } catch (e) {}
+
+      await logActivity(currentVoter, "已完成票選", currentIp);
       setHasSubmitted(true);
       setShowSuccessModal(true); 
       setTimeout(() => setShowSuccessModal(false), 2000);
-    } catch (e) { console.error("Voting error:", e); alert("投票送出失敗"); } 
-    finally { setIsSubmitting(false); }
+    } catch (e) {
+      console.error("Voting error:", e);
+      alert("投票送出失敗");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
-  // ... (Helpers, Handlers) ...
-  const formatSeatNo = (val) => { if (!val) return ""; const d = val.replace(/[^0-9]/g, ''); if (!d) return val; const n = parseInt(d, 10); return n < 10 ? `0${n}` : `${n}`; };
-  const getStudentNameLabel = (seatNo) => { const name = STUDENT_NAME_MAP[seatNo]; if (name) return name.slice(-2); return seatNo; };
-  const getStudentFullName = (seatNo) => { const name = STUDENT_NAME_MAP[seatNo]; return name ? `${seatNo} ${name}` : `座號 ${seatNo}`; };
-  const parseTimestampToYMD = (ts) => { if (!ts) return null; try { const m = ts.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/); if (m) return `${parseInt(m[1],10)}-${String(parseInt(m[2],10)).padStart(2,'0')}-${String(parseInt(m[3],10)).padStart(2,'0')}`; return null; } catch { return null; } };
+  // Helper Functions
+  const formatSeatNo = (val) => {
+    if (!val) return "";
+    const digits = val.replace(/[^0-9]/g, '');
+    if (!digits) return val; 
+    const num = parseInt(digits, 10);
+    return num < 10 ? `0${num}` : `${num}`;
+  };
+  const getStudentNameLabel = (seatNo) => {
+    const name = STUDENT_NAME_MAP[seatNo];
+    if (name) return name.slice(-2);
+    return seatNo; 
+  };
+  const getStudentFullName = (seatNo) => {
+    const name = STUDENT_NAME_MAP[seatNo];
+    return name ? `${seatNo} ${name}` : `座號 ${seatNo}`;
+  };
+  const parseTimestampToYMD = (ts) => {
+    if (!ts) return null;
+    try {
+      const match = ts.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+      if (match) {
+        const year = parseInt(match[1], 10);
+        const month = parseInt(match[2], 10);
+        const day = parseInt(match[3], 10);
+        const mm = String(month).padStart(2, '0');
+        const dd = String(day).padStart(2, '0');
+        return `${year}-${mm}-${dd}`;
+      }
+      return null;
+    } catch (e) { return null; }
+  };
   const handleOpenVoters = (posCode, candidateSeatNo, candidateName) => {
     const key = `${posCode}_${candidateSeatNo}`;
     const voters = voteRecords[key] || [];
@@ -610,13 +667,24 @@ const App = () => {
     let ownChoices = [];
     if (candidateData && candidateData.original) {
       const parts = candidateData.original.split(/[,，]/).map(p => p.trim());
-      parts.slice(1).forEach(p => { const c = p.toUpperCase().replace(/[^0-9X]/g, ''); if (c && c !== 'X') if (!ownChoices.includes(c)) ownChoices.push(c); });
+      const choiceParts = parts.slice(1);
+      const seen = new Set();
+      choiceParts.forEach(p => {
+        const clean = p.toUpperCase().replace(/[^0-9X]/g, '');
+        if (clean && clean !== 'X') {
+          if (!seen.has(clean)) { seen.add(clean); ownChoices.push(clean); }
+        }
+      });
     }
     setViewingVoters({ posCode, candidateSeatNo, candidateName, voters, ownChoices });
   };
+  
+  // ... Editing & Modal handlers ...
   const handleClearAll = () => setVisualChoices([]);
   const handleRemoveChoice = (idx) => setVisualChoices(prev => prev.filter((_, i) => i !== idx));
   const handleAddChoice = (code) => { if(visualChoices.length < 19) setVisualChoices([...visualChoices, code]) };
+
+  // ... handleCopy, getDuplicates, fetchData, processStudentData, renderAdvancedBattery ... 
   const handleCopy = () => {
     const textArea = document.createElement("textarea");
     textArea.value = generatedString;
@@ -626,21 +694,44 @@ const App = () => {
     document.body.appendChild(textArea);
     textArea.focus();
     textArea.select();
-    try { if (document.execCommand('copy')) { setCopySuccess(true); setTimeout(() => setCopySuccess(false), 2000); } } catch (err) { console.error(err); }
+    try {
+      const successful = document.execCommand('copy');
+      if (successful) {
+        setCopySuccess(true);
+        setTimeout(() => setCopySuccess(false), 2000);
+      }
+    } catch (err) { console.error(err); }
     document.body.removeChild(textArea);
   };
-  const getDuplicates = (choices) => { const s = new Set(); const d = new Set(); choices.forEach(c => { if(s.has(c)) d.add(c); s.add(c); }); return d; };
+  const getDuplicates = (choices) => {
+    const seen = new Set();
+    const duplicates = new Set();
+    choices.forEach(code => {
+      if (seen.has(code)) duplicates.add(code);
+      seen.add(code);
+    });
+    return duplicates;
+  };
   const fetchData = async () => {
     setLoading(true);
     try {
       const response = await fetch(CSV_URL);
       const text = await response.text();
-      const rows = text.split(/\r?\n/).map(row => { const regex = /(".*?"|[^",]+)(?=\s*,|\s*$)/g; const matches = row.match(regex); return matches ? matches.map(m => m.replace(/^"|"$/g, '').trim()) : []; }).filter(row => row.length >= 5);
-      const contentRows = rows.slice(1); setRawRows(contentRows);
+      const rows = text.split(/\r?\n/).map(row => {
+        const regex = /(".*?"|[^",]+)(?=\s*,|\s*$)/g;
+        const matches = row.match(regex);
+        return matches ? matches.map(m => m.replace(/^"|"$/g, '').trim()) : [];
+      }).filter(row => row.length >= 5);
+      const contentRows = rows.slice(1); 
+      setRawRows(contentRows);
       if (contentRows.length > 0) {
         let maxDateStr = "";
-        contentRows.forEach(row => { const ymd = parseTimestampToYMD(row[0]); if (ymd) { if (maxDateStr === "" || ymd > maxDateStr) maxDateStr = ymd; } });
-        if (maxDateStr) { setFilterDate(maxDateStr); setDetectedLatestDate(maxDateStr); } else { setDetectedLatestDate("未偵測到有效日期"); }
+        contentRows.forEach(row => {
+          const ymd = parseTimestampToYMD(row[0]);
+          if (ymd) { if (maxDateStr === "" || ymd > maxDateStr) maxDateStr = ymd; }
+        });
+        if (maxDateStr) { setFilterDate(maxDateStr); setDetectedLatestDate(maxDateStr); } 
+        else { setDetectedLatestDate("未偵測到有效日期"); }
       } else { setDetectedLatestDate("無資料"); }
       setLastUpdated(new Date().toLocaleTimeString());
     } catch (err) { console.error(err); setDetectedLatestDate("讀取失敗"); } 
@@ -648,25 +739,66 @@ const App = () => {
   };
   useEffect(() => { if (rawRows.length > 0 && currentUser) processStudentData(rawRows); }, [rawRows, filterDate, currentUser]);
   const processStudentData = (rows) => {
-    const stats = {}; const errorList = []; const tempStudentCounts = []; let count = 0; 
+    const stats = {};
+    const errorList = [];
+    const tempStudentCounts = []; 
+    let count = 0; 
     Object.keys(POSITION_MAP).forEach(code => { stats[code] = { 1: [], 2: [], 3: [] }; });
     rows.forEach((row, index) => {
-      const timestampRaw = row[0] || ""; const prefString = row[3] || ""; let rawSeatNo = row[4] ? row[4].trim() : ""; 
+      const timestampRaw = row[0] || "";  
+      const prefString = row[3] || "";    
+      const seatNoOfficial = row[4] ? row[4].trim() : ""; 
       if (!prefString) return;
-      if (filterDate && timestampRaw) { const rowYMD = parseTimestampToYMD(timestampRaw); if (rowYMD && rowYMD < filterDate) return; }
+      if (filterDate && timestampRaw) {
+        const rowYMD = parseTimestampToYMD(timestampRaw);
+        if (rowYMD && rowYMD < filterDate) return;
+      }
       count++;
       const parts = prefString.split(/[,，]/).map(p => p.trim());
+      let rawSeatNo = seatNoOfficial;
       if (!rawSeatNo && parts.length > 0) rawSeatNo = parts[0];
       const displaySeatNo = formatSeatNo(rawSeatNo) || `Row ${index + 2}`;
       const choiceParts = parts.slice(1);
-      const effectiveChoices = []; const duplicatesDetected = new Set(); const seen = new Set();
-      choiceParts.forEach(p => { const clean = p.toUpperCase().replace(/[^0-9X]/g, ''); if (clean === "") return; if (clean !== 'X') { if (seen.has(clean)) duplicatesDetected.add(clean); seen.add(clean); effectiveChoices.push(clean); } });
-      tempStudentCounts.push({ seatNo: displaySeatNo, count: effectiveChoices.length, hasError: duplicatesDetected.size > 0, original: prefString, duplicateCodes: Array.from(duplicatesDetected) });
-      if (duplicatesDetected.size > 0) { errorList.push({ id: `err-${index}-${displaySeatNo}`, seatNo: displaySeatNo, original: prefString, parsedResult: effectiveChoices.join(', '), error: "選填代碼重複", duplicateCodes: Array.from(duplicatesDetected) }); return; }
-      effectiveChoices.forEach((choice, idx) => { const rank = idx + 1; if (rank <= 3) { if (stats[choice]) stats[choice][rank].push(displaySeatNo); } });
+      const effectiveChoices = [];
+      const duplicatesDetected = new Set();
+      const seen = new Set();
+      choiceParts.forEach(p => {
+        const clean = p.toUpperCase().replace(/[^0-9X]/g, '');
+        if (clean === "") return; 
+        if (clean !== 'X') {
+            if (seen.has(clean)) duplicatesDetected.add(clean);
+            seen.add(clean);
+            effectiveChoices.push(clean);
+        }
+      });
+      tempStudentCounts.push({
+        seatNo: displaySeatNo,
+        count: effectiveChoices.length,
+        hasError: duplicatesDetected.size > 0,
+        original: prefString, 
+        duplicateCodes: Array.from(duplicatesDetected) 
+      });
+      if (duplicatesDetected.size > 0) {
+        errorList.push({
+          id: `err-${index}-${displaySeatNo}`,
+          seatNo: displaySeatNo,
+          original: prefString,
+          parsedResult: effectiveChoices.join(', '), 
+          error: "選填代碼重複",
+          duplicateCodes: Array.from(duplicatesDetected)
+        });
+        return; 
+      }
+      effectiveChoices.forEach((choice, idx) => {
+        const rank = idx + 1;
+        if (rank <= 3) { if (stats[choice]) stats[choice][rank].push(displaySeatNo); }
+      });
     });
     tempStudentCounts.sort((a, b) => parseInt(a.seatNo,10) - parseInt(b.seatNo,10));
-    setStatistics(stats); setErrors(errorList); setStudentCounts(tempStudentCounts); setFilteredCount(count); 
+    setStatistics(stats);
+    setErrors(errorList);
+    setStudentCounts(tempStudentCounts);
+    setFilteredCount(count); 
   };
   const renderAdvancedBattery = (count) => {
     let colorClass = "bg-teal-300"; 
@@ -674,17 +806,73 @@ const App = () => {
     else if (count >= 15 && count < 20) colorClass = "bg-orange-300";
     else if (count >= 20) colorClass = "bg-rose-300";
     const shapes = [];
-    if (count >= 5) { shapes.push(<div key="b" className={`h-3 w-4 rounded-sm ${colorClass}`} />); for(let i=0;i<count%5;i++) shapes.push(<div key={`r${i}`} className={`h-3 w-1.5 rounded-sm ${colorClass}`} />); }
-    else { for(let i=0;i<count;i++) shapes.push(<div key={`s${i}`} className={`h-3 w-1.5 rounded-sm ${colorClass}`} />); }
+    if (count >= 5) {
+      shapes.push(<div key="big" className={`h-3 w-4 rounded-sm ${colorClass}`} />);
+      for (let i = 0; i < count % 5; i++) shapes.push(<div key={`r${i}`} className={`h-3 w-1.5 rounded-sm ${colorClass}`} />);
+    } else {
+      for (let i = 0; i < count; i++) shapes.push(<div key={`s${i}`} className={`h-3 w-1.5 rounded-sm ${colorClass}`} />);
+    }
     return shapes;
   };
-  useEffect(() => { if (editingStudent) { const parts = (editingStudent.original || "").split(/[,，]/).map(p => p.trim()); const choiceParts = parts.slice(1); const initialChoices = []; choiceParts.forEach(p => { const c = p.toUpperCase().replace(/[^0-9X]/g, ''); if (c && c !== 'X') initialChoices.push(c); }); setVisualChoices(initialChoices); setCopySuccess(false); } }, [editingStudent]);
-  useEffect(() => { if (!editingStudent) return; const parts = (editingStudent.original || "").split(/[,，]/).map(p => p.trim()); const seatStr = parts[0] || editingStudent.seatNo; setGeneratedString(`${seatStr},${visualChoices.join(',')}`); }, [visualChoices, editingStudent]);
-  useEffect(() => { const handleKeyDown = (e) => { if (showPasswordModal) return; if (!editingStudent || viewMode !== 'teacher') return; if (e.key === 'ArrowLeft') handlePrevStudent(); if (e.key === 'ArrowRight') handleNextStudent(); if (e.key === 'Escape') setEditingStudent(null); }; window.addEventListener('keydown', handleKeyDown); return () => window.removeEventListener('keydown', handleKeyDown); }, [editingStudent, studentCounts, viewMode, showPasswordModal]);
   
-  const filteredPositions = Object.entries(POSITION_MAP).filter(([code, name]) => name.includes(searchTerm) || code.includes(searchTerm));
+  const handleSwitchModeClick = () => {
+    if (isLockedOut) return; 
+    if (viewMode === 'teacher') {
+      setViewMode('student');
+      setDraftVotes({});
+      setCurrentVoter("");
+      setHasSubmitted(false);
+      setMissingCodes([]); 
+    } else {
+      const randomChallenge = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
+      setCurrentChallenge(randomChallenge);
+      setShowPasswordModal(true);
+      setPasswordInput('');
+      setPasswordError(false);
+    }
+  };
+  const handlePasswordSubmit = (e) => {
+    e.preventDefault();
+    if (!currentChallenge) return;
+    try {
+      const answer = atob(currentChallenge.a);
+      const expected = `${answer}38`;
+      if (passwordInput.toLowerCase().trim() === expected) {
+        setViewMode('teacher');
+        setShowPasswordModal(false);
+        setFailedAttempts(0); 
+        // Reset student voting state when entering teacher mode
+        setDraftVotes({});
+        setCurrentVoter("");
+        setHasSubmitted(false);
+        setMissingCodes([]); 
+      } else {
+        const newAttempts = failedAttempts + 1;
+        setFailedAttempts(newAttempts);
+        setPasswordInput('');
+        if (newAttempts >= 3) {
+          setIsLockedOut(true);
+          setShowPasswordModal(false);
+          alert("錯誤次數過多，管理模式已鎖定。");
+        } else {
+          setPasswordError(true);
+          const nextChallenge = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
+          setCurrentChallenge(nextChallenge);
+        }
+      }
+    } catch {
+      setPasswordError(true);
+      setPasswordInput('');
+    }
+  };
 
-  // --- SUB-COMPONENTS ---
+  // Define filteredPositions for Main Render
+  const filteredPositions = Object.entries(POSITION_MAP).filter(([code, name]) => 
+    name.includes(searchTerm) || code.includes(searchTerm)
+  );
+
+  // --- SUB-COMPONENTS (Defined as functions here to avoid scope issues) ---
+
   const ForceLoginModal = () => {
     if (!showForceLoginModal) return null;
     return (
@@ -692,14 +880,23 @@ const App = () => {
           <div className="bg-white rounded-3xl shadow-2xl max-w-sm w-full border-4 border-rose-200 p-8 flex flex-col items-center">
              <div className="bg-rose-100 p-4 rounded-full mb-4 text-rose-500"><AlertOctagon size={40} /></div>
              <h3 className="text-xl font-bold text-slate-700 mb-2">⚠️ 重複登入衝突</h3>
-             <p className="text-slate-400 text-sm mb-4 text-center font-medium">座號 <span className="font-bold text-indigo-600 text-lg">{selectedLoginSeat}</span> 目前已在其他裝置上使用中。<br/>(佔用者 IP: <span className="font-mono bg-slate-100 px-1 rounded">{conflictIP}</span>)</p>
-             <p className="text-rose-500 text-xs font-bold mb-6 text-center bg-rose-50 p-3 rounded-xl border border-rose-100">請通知老師處理！<br/>老師輸入管理密碼後可重置此身份。</p>
+             <p className="text-slate-500 text-sm mb-4 text-center font-medium">
+               座號 <span className="font-bold text-indigo-600 text-lg">{selectedLoginSeat}</span> 目前已在其他裝置上使用中。<br/>
+               (佔用者 IP: <span className="font-mono bg-slate-100 px-1 rounded">{conflictIP}</span>)
+             </p>
+             <p className="text-rose-500 text-xs font-bold mb-6 text-center bg-rose-50 p-3 rounded-xl border border-rose-100">
+               請通知老師處理！<br/>老師輸入管理密碼後可重置此身份。
+             </p>
              <input type="password" autoFocus className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 text-center font-bold text-slate-700 outline-none mb-4" placeholder="請老師輸入管理密碼..." value={forceLoginPassword} onChange={e => setForceLoginPassword(e.target.value)}/>
-             <div className="flex gap-3 w-full"><button onClick={() => { setShowForceLoginModal(false); setForceLoginPassword(''); }} className="flex-1 bg-slate-100 text-slate-500 py-3 rounded-xl font-bold hover:bg-slate-200 transition-colors">取消</button><button onClick={handleForceLogin} className="flex-1 bg-rose-500 text-white py-3 rounded-xl font-bold hover:bg-rose-600 shadow-lg shadow-rose-200 transition-colors">強制登入並重置</button></div>
+             <div className="flex gap-3 w-full">
+                <button onClick={() => { setShowForceLoginModal(false); setForceLoginPassword(''); }} className="flex-1 bg-slate-100 text-slate-500 py-3 rounded-xl font-bold hover:bg-slate-200 transition-colors">取消</button>
+                <button onClick={handleForceLogin} className="flex-1 bg-rose-500 text-white py-3 rounded-xl font-bold hover:bg-rose-600 shadow-lg shadow-rose-200 transition-colors">強制登入並重置</button>
+             </div>
           </div>
        </div>
     );
   }
+
   const SuccessOverlay = () => {
     if (viewMode === 'student' && showSuccessModal) {
       return (
@@ -714,31 +911,55 @@ const App = () => {
     }
     return null;
   };
+
   const StudentSubmitFab = () => {
     const count = Object.keys(draftVotes).length;
     if (viewMode !== 'student' || hasSubmitted) return null;
+
     return (
       <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom-10 fade-in duration-500 flex items-center gap-3">
-        {!currentVoter && <div className="bg-rose-500 text-white text-sm font-bold px-4 py-2 rounded-xl animate-bounce">請先在右上方選擇您的座號！</div>}
-        <button onClick={handleValidateAndSubmit} disabled={count === 0 || isSubmitting || !currentVoter} className={`flex items-center gap-2 px-6 py-4 rounded-full shadow-xl transition-all transform hover:scale-105 active:scale-95 ${count > 0 && !isSubmitting && currentVoter ? 'bg-gradient-to-r from-rose-400 to-orange-400 text-white hover:from-rose-500 hover:to-orange-500' : 'bg-slate-300 text-slate-500 cursor-not-allowed'}`}>
-          {isSubmitting ? <RefreshCw className="animate-spin" size={24} /> : <Send size={24} fill="currentColor" />}
-          <div className="flex flex-col items-start"><span className="text-sm font-bold leading-none">送出審慎的一票</span><span className="text-xs font-medium opacity-90 leading-none mt-1">已選 {count} 位候選人</span></div>
+        {!currentVoter && (
+          <div className="bg-rose-500 text-white text-sm font-bold px-4 py-2 rounded-xl animate-bounce">
+            請先在右上方選擇您的座號！
+          </div>
+        )}
+        <button
+          onClick={handleValidateAndSubmit}
+          disabled={count === 0 || isSubmitting || !currentVoter}
+          className={`flex items-center gap-2 px-6 py-4 rounded-full shadow-xl transition-all transform hover:scale-105 active:scale-95 ${
+            count > 0 && !isSubmitting && currentVoter
+              ? 'bg-gradient-to-r from-rose-400 to-orange-400 text-white hover:from-rose-500 hover:to-orange-500' 
+              : 'bg-slate-300 text-slate-500 cursor-not-allowed'
+          }`}
+        >
+          {isSubmitting ? (
+            <RefreshCw className="animate-spin" size={24} />
+          ) : (
+            <Send size={24} fill="currentColor" />
+          )}
+          <div className="flex flex-col items-start">
+            <span className="text-sm font-bold leading-none">送出審慎的一票</span>
+            <span className="text-xs font-medium opacity-90 leading-none mt-1">已選 {count} 位候選人</span>
+          </div>
         </button>
       </div>
     );
   };
 
-  // --- RENDER ---
+  // --- LOGIN PAGE RENDER ---
   if (viewMode === 'login' || !currentUser) {
     return (
       <div className="min-h-screen bg-rose-50 flex items-center justify-center p-4" style={{ fontFamily: '"Zen Maru Gothic", sans-serif' }}>
         <div className="bg-white rounded-3xl shadow-2xl p-8 max-w-md w-full border-4 border-indigo-100 flex flex-col items-center animate-in zoom-in-95 duration-500">
-          <div className="bg-rose-400 p-4 rounded-full shadow-lg shadow-rose-200 mb-6 transform -rotate-6"><Heart size={40} fill="white" className="text-white" /></div>
+          <div className="bg-rose-400 p-4 rounded-full shadow-lg shadow-rose-200 mb-6 transform -rotate-6">
+            <Heart size={40} fill="white" className="text-white" />
+          </div>
           <h1 className="text-3xl font-bold text-slate-700 mb-2 text-center">幹部志願選填系統</h1>
           <p className="text-slate-400 mb-8 text-center font-medium">請使用學校 Google 帳號登入</p>
           <div className="w-full space-y-4">
             <button onClick={handleGoogleLogin} className="w-full flex items-center justify-center gap-3 bg-white border-2 border-slate-200 p-4 rounded-2xl hover:bg-slate-50 hover:border-indigo-300 hover:shadow-md transition-all group">
-               <img src="https://www.google.com/favicon.ico" alt="Google" className="w-6 h-6" /><span className="text-slate-600 font-bold group-hover:text-indigo-600">老師登入 (Google)</span>
+               <img src="https://www.google.com/favicon.ico" alt="Google" className="w-6 h-6" />
+               <span className="text-slate-600 font-bold group-hover:text-indigo-600">老師登入 (Google)</span>
             </button>
             <div className="relative flex py-2 items-center"><div className="flex-grow border-t border-slate-200"></div><span className="flex-shrink-0 mx-4 text-slate-300 text-xs">或</span><div className="flex-grow border-t border-slate-200"></div></div>
             <div className="bg-slate-50 p-4 rounded-2xl border-2 border-slate-100">
@@ -746,33 +967,54 @@ const App = () => {
               <div className="flex gap-2">
                 <select className="flex-1 bg-white border-2 border-indigo-100 rounded-xl px-4 py-2 text-sm font-bold text-slate-600 outline-none focus:border-indigo-300 cursor-pointer" value={selectedLoginSeat} onChange={(e) => setSelectedLoginSeat(e.target.value)}>
                   <option value="">請選擇座號...</option>
-                  {Array.from({length: 30}, (_, i) => { const num = (i + 1).toString().padStart(2, '0'); return <option key={num} value={num}>{num} {getStudentNameLabel(num)}</option> })}
+                  {Array.from({length: 30}, (_, i) => {
+                    const num = (i + 1).toString().padStart(2, '0');
+                    return <option key={num} value={num}>{num} {getStudentNameLabel(num)}</option>
+                  })}
                 </select>
-                <button onClick={handleStudentDirectLogin} disabled={loading || !selectedLoginSeat} className={`px-4 py-2 rounded-xl text-white font-bold transition-all shadow-sm ${loading || !selectedLoginSeat ? 'bg-slate-300 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600 active:scale-95'}`}>{loading ? <RefreshCw className="animate-spin" size={18}/> : <ArrowRight size={18}/>}</button>
+                <button onClick={handleStudentDirectLogin} disabled={loading || !selectedLoginSeat} className={`px-4 py-2 rounded-xl text-white font-bold transition-all shadow-sm ${loading || !selectedLoginSeat ? 'bg-slate-300 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600 active:scale-95'}`}>
+                  {loading ? <RefreshCw className="animate-spin" size={18}/> : <ArrowRight size={18}/>}
+                </button>
               </div>
             </div>
           </div>
           {loginError && <div className="mt-4 bg-rose-50 text-rose-500 px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2"><AlertTriangle size={16} />{loginError}</div>}
-          <ForceLoginModal />
+          
+          <ForceLoginModal /> {/* Render ForceLoginModal here too in case conflict happens during login check */}
         </div>
       </div>
     );
   }
 
+  // --- MAIN APP UI ---
   return (
     <>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&display=swap');`}</style>
+      <style>
+        {`@import url('https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&display=swap');`}
+      </style>
       <div className={`min-h-screen pb-20 relative font-sans ${viewMode === 'teacher' ? 'bg-rose-50' : 'bg-slate-50'}`} style={{ fontFamily: '"Zen Maru Gothic", sans-serif' }}>
+        
         <SuccessOverlay />
         <StudentSubmitFab />
+        {/* Only show force login modal if we are NOT on login screen (handled above) or if it's triggered during session */}
         {viewMode !== 'login' && <ForceLoginModal />} 
+        
         <input type="file" ref={fileInputRef} style={{ display: 'none' }} accept=".json" onChange={handleImportData} />
 
+        {/* Validation Modals... (Same as before) */}
         {showIncompleteModal && (
           <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
              <div className="bg-white rounded-3xl shadow-2xl max-w-md w-full p-6 border-4 border-orange-200">
-                <div className="flex flex-col items-center mb-4 text-center"><div className="bg-orange-100 p-3 rounded-full mb-3 text-orange-500"><AlertTriangle size={32}/></div><h3 className="text-xl font-bold text-slate-700">您還有職務未投票喔！</h3><p className="text-sm text-slate-400">請完成以下職務的投票：</p></div>
-                <div className="bg-orange-50 p-4 rounded-xl mb-4 max-h-40 overflow-y-auto"><ul className="list-disc list-inside text-sm font-bold text-orange-600">{missingPositions.map((pos,i) => <li key={i}>{pos}</li>)}</ul></div>
+                <div className="flex flex-col items-center mb-4 text-center">
+                   <AlertTriangle className="text-orange-500 mb-2" size={40}/>
+                   <h3 className="text-xl font-bold text-slate-700">您還有職務未投票喔！</h3>
+                   <p className="text-sm text-slate-400">請完成以下職務的投票：</p>
+                </div>
+                <div className="bg-orange-50 p-4 rounded-xl mb-4 max-h-40 overflow-y-auto">
+                   <ul className="list-disc list-inside text-sm font-bold text-orange-600">
+                      {missingPositions.map((pos,i) => <li key={i}>{pos}</li>)}
+                   </ul>
+                </div>
                 <button onClick={()=>setShowIncompleteModal(false)} className="w-full bg-orange-400 text-white py-3 rounded-xl font-bold hover:bg-orange-500">好，我去投！</button>
              </div>
           </div>
@@ -780,8 +1022,15 @@ const App = () => {
         {showConfirmModal && (
            <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
               <div className="bg-white rounded-3xl shadow-2xl max-w-sm w-full p-6 border-4 border-teal-100">
-                 <div className="flex flex-col items-center mb-4 text-center"><div className="bg-teal-100 p-3 rounded-full mb-3 text-teal-500"><HelpCircle size={32}/></div><h3 className="text-xl font-bold text-slate-700">確定送出選票？</h3><p className="text-sm text-slate-400">送出後無法修改，請確認。</p></div>
-                 <div className="flex gap-3"><button onClick={()=>setShowConfirmModal(false)} className="flex-1 bg-slate-100 text-slate-500 py-3 rounded-xl font-bold">再檢查</button><button onClick={confirmSubmit} className="flex-1 bg-teal-500 text-white py-3 rounded-xl font-bold hover:bg-teal-600">確認送出</button></div>
+                 <div className="flex flex-col items-center mb-4 text-center">
+                    <HelpCircle className="text-teal-500 mb-2" size={40}/>
+                    <h3 className="text-xl font-bold text-slate-700">確定送出選票？</h3>
+                    <p className="text-sm text-slate-400">送出後無法修改，請確認。</p>
+                 </div>
+                 <div className="flex gap-3">
+                    <button onClick={()=>setShowConfirmModal(false)} className="flex-1 bg-slate-100 text-slate-500 py-3 rounded-xl font-bold">再檢查</button>
+                    <button onClick={confirmSubmit} className="flex-1 bg-teal-500 text-white py-3 rounded-xl font-bold hover:bg-teal-600">確認送出</button>
+                 </div>
               </div>
            </div>
         )}
@@ -804,6 +1053,7 @@ const App = () => {
                  {viewMode === 'student' && !hasSubmitted && (
                    <div className="flex items-center gap-2 bg-white border-2 border-indigo-200 rounded-full px-3 py-1.5 ml-auto md:ml-0 shadow-sm w-32 justify-center">
                      <User size={16} className="text-indigo-400" />
+                     {/* Lock seat selector to authenticated user role if student */}
                      <span className="text-sm font-bold text-slate-600">{currentVoter} {getStudentNameLabel(currentVoter)}</span>
                    </div>
                  )}
@@ -819,8 +1069,11 @@ const App = () => {
         </header>
 
         <main className="max-w-7xl mx-auto px-4 py-6">
+           {/* ... Teacher Controls ... */}
            {viewMode === 'teacher' && (
               <div className="mb-6 bg-white/90 backdrop-blur rounded-3xl border border-rose-100 p-1 shadow-sm flex flex-wrap items-center justify-between animate-in fade-in">
+                 {/* ... Date Picker, Limit, Auto Assign, Export ... */}
+                 {/* (Same as previous code, collapsed for brevity) */}
                  <div className="flex items-center gap-2 p-3">
                     <div className="bg-rose-100 p-2.5 rounded-2xl text-rose-500"><CalendarIcon size={20}/></div>
                     <div><label className="text-[10px] font-bold text-rose-300 uppercase block mb-0.5">起始日期</label><input type="date" className="text-sm font-bold bg-transparent border-none p-0 outline-none cursor-pointer" value={filterDate} onChange={e=>setFilterDate(e.target.value)}/></div>
@@ -836,8 +1089,6 @@ const App = () => {
                  <div className="h-10 w-px bg-rose-100 hidden md:block"></div>
                  <div className="flex gap-2 p-3">
                     <button onClick={handleAutoAssign} className="bg-purple-100 text-purple-600 p-2.5 rounded-2xl hover:bg-purple-200 flex gap-2 items-center"><Zap size={20}/><span className="text-sm font-bold">自動錄取</span></button>
-                    {/* New Clear Votes Button */}
-                    <button onClick={handleClearVotes} className="bg-rose-100 text-rose-600 p-2.5 rounded-2xl hover:bg-rose-200 flex gap-2 items-center"><Trash2 size={20}/><span className="text-sm font-bold">清除投票</span></button>
                  </div>
                  <div className="h-10 w-px bg-rose-100 hidden md:block"></div>
                  <div className="flex gap-2 p-3 pr-6">
@@ -847,11 +1098,17 @@ const App = () => {
               </div>
            )}
 
+           {/* ... Errors & Student Counts ... */}
+           {/* (Same logic, relying on viewMode) */}
            {viewMode === 'teacher' && errors.length > 0 && (
              <div className="mb-6 animate-in fade-in slide-in-from-top-4">
+                {/* ... Error Block Content ... */}
                 <div className="bg-white/80 border-2 border-rose-200 rounded-3xl p-5 shadow-sm relative overflow-hidden">
                   <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-rose-300 via-orange-300 to-yellow-300"></div>
-                  <h2 className="text-rose-500 font-bold flex items-center gap-2 text-lg mb-4"><div className="bg-rose-100 p-1.5 rounded-full"><AlertTriangle className="text-rose-500" size={20} /></div>重複選填名單 <span className="text-xs font-bold text-rose-400 bg-rose-50 px-3 py-1 rounded-full border border-rose-100">共 {errors.length} 位</span></h2>
+                  <h2 className="text-rose-500 font-bold flex items-center gap-2 text-lg mb-4">
+                    <div className="bg-rose-100 p-1.5 rounded-full"><AlertTriangle className="text-rose-500" size={20} /></div>
+                    重複選填名單 <span className="text-xs font-bold text-rose-400 bg-rose-50 px-3 py-1 rounded-full border border-rose-100">共 {errors.length} 位</span>
+                  </h2>
                   <div className="flex flex-wrap gap-3">
                     {errors.map((err) => (
                       <button key={err.id} onClick={() => setEditingStudent(err)} className="bg-rose-50/50 border border-rose-100 p-3 rounded-2xl hover:bg-rose-50 hover:border-rose-300 transition-all text-left flex items-center gap-3 group w-auto min-w-fit shrink-0">
@@ -867,9 +1124,14 @@ const App = () => {
 
           {studentCounts.length > 0 && (
             <div className="mb-8">
+              {/* ... Student Counts Content ... */}
               <div className="bg-white/80 border-2 border-indigo-50 rounded-3xl p-6 shadow-sm">
                 <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-indigo-800 font-bold flex items-center gap-2 text-lg"><div className="bg-indigo-100 p-1.5 rounded-xl"><BarChart3 className="text-indigo-500" size={20} /></div>志願數量一覽{viewMode === 'student' && <span className="text-xs text-slate-400 font-normal ml-2">(學生隱私保護模式)</span>}</h2>
+                  <h2 className="text-indigo-800 font-bold flex items-center gap-2 text-lg">
+                    <div className="bg-indigo-100 p-1.5 rounded-xl"><BarChart3 className="text-indigo-500" size={20} /></div>
+                    志願數量一覽
+                    {viewMode === 'student' && <span className="text-xs text-slate-400 font-normal ml-2">(學生隱私保護模式)</span>}
+                  </h2>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {studentCounts.map((student, idx) => (
@@ -884,17 +1146,24 @@ const App = () => {
             </div>
           )}
 
+          {/* ... Modals (Editing, Map, Voters) ... */}
+          {/* (Modals code omitted for brevity as they are same as previous logic, just part of render) */}
           {editingStudent && viewMode === 'teacher' && (
              <div className="fixed inset-0 bg-rose-900/30 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
                <div className="bg-white rounded-3xl shadow-2xl max-w-4xl w-full overflow-hidden border-4 border-rose-100 flex flex-col max-h-[95vh]">
+                 {/* ... Edit Modal Content ... */}
                  <div className="bg-rose-50 px-4 py-3 border-b border-rose-100 flex items-center justify-between shrink-0">
                     <button onClick={handlePrevStudent} className="p-2 rounded-xl"><ChevronLeft size={20}/></button>
                     <div className="flex items-center gap-3"><span className="bg-rose-400 text-white text-lg font-bold px-4 py-1 rounded-xl">{editingStudent.seatNo}</span></div>
                     <div className="flex items-center gap-2"><button onClick={handleNextStudent} className="p-2 rounded-xl"><ChevronRight size={20}/></button><button onClick={() => setEditingStudent(null)} className="p-2 rounded-full"><X size={24}/></button></div>
                  </div>
                  <div className="p-6 space-y-6 overflow-y-auto flex-1 bg-slate-50/50">
+                    {/* ... Visual Editor ... */}
                     <div>
-                      <div className="flex justify-between items-center mb-3"><h4 className="text-sm font-bold text-slate-500 flex items-center gap-2 uppercase tracking-wider"><Edit3 size={16}/> 志願排序</h4><button onClick={handleClearAll} className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-rose-50 text-rose-500"><Trash2 size={14}/>全部清除</button></div>
+                      <div className="flex justify-between items-center mb-3">
+                        <h4 className="text-sm font-bold text-slate-500 flex items-center gap-2 uppercase tracking-wider"><Edit3 size={16}/> 志願排序</h4>
+                        <button onClick={handleClearAll} className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-rose-50 text-rose-500"><Trash2 size={14}/>全部清除</button>
+                      </div>
                       <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-2">
                         {Array.from({ length: 19 }).map((_, i) => {
                           const code = visualChoices[i];
@@ -903,14 +1172,21 @@ const App = () => {
                             <div key={i} className={`relative h-14 rounded-xl border-2 flex flex-row items-center justify-center p-1 ${code ? (isDuplicate ? 'bg-rose-100 border-rose-300' : 'bg-white border-indigo-100') : 'bg-slate-100/50 border-dashed border-slate-200'}`}>
                               <span className="absolute top-0.5 left-1.5 text-[9px] font-bold text-slate-300">{i+1}</span>
                               {code ? (
-                                <div className="flex items-center gap-1 mt-1"><span className="text-xs font-bold px-1.5 rounded bg-slate-100 text-slate-500">#{code}</span><span className="text-xs font-bold truncate max-w-[60px] text-slate-700">{POSITION_MAP[code]}</span><button onClick={() => handleRemoveChoice(i)} className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-slate-200 text-slate-500 hover:bg-slate-300"><X size={10} strokeWidth={3}/></button></div>
+                                <div className="flex items-center gap-1 mt-1">
+                                  <span className="text-xs font-bold px-1.5 rounded bg-slate-100 text-slate-500">#{code}</span>
+                                  <span className="text-xs font-bold truncate max-w-[60px] text-slate-700">{POSITION_MAP[code]}</span>
+                                  <button onClick={() => handleRemoveChoice(i)} className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-slate-200 text-slate-500 hover:bg-slate-300"><X size={10} strokeWidth={3}/></button>
+                                </div>
                               ) : <span className="text-slate-300 text-xs mt-1">空缺</span>}
                             </div>
                           )
                         })}
                       </div>
                     </div>
-                    <div className="bg-slate-50 px-6 py-4 border-t border-slate-100 flex justify-end gap-3"><button onClick={handleCopy} disabled={!isValid} className="flex items-center gap-2 px-6 py-2 rounded-xl text-white font-bold bg-indigo-500 hover:bg-indigo-600">{copySuccess ? <Check size={18}/> : <Copy size={18}/>} 複製</button></div>
+                    {/* ... Add Choice & Copy ... */}
+                    <div className="bg-slate-50 px-6 py-4 border-t border-slate-100 flex justify-end gap-3">
+                       <button onClick={handleCopy} disabled={!isValid} className="flex items-center gap-2 px-6 py-2 rounded-xl text-white font-bold bg-indigo-500 hover:bg-indigo-600">{copySuccess ? <Check size={18}/> : <Copy size={18}/>} 複製</button>
+                    </div>
                  </div>
                </div>
              </div>
@@ -918,16 +1194,28 @@ const App = () => {
 
           {viewingVoters && viewMode === 'teacher' && (
              <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                {/* ... Viewing Voters Modal ... */}
                 <div className="bg-white rounded-3xl shadow-2xl max-w-lg w-full border-4 border-slate-100 flex flex-col max-h-[85vh]">
-                   <div className="bg-slate-50 px-6 py-4 border-b border-slate-100 flex justify-between items-center"><h3 className="font-bold text-slate-700 text-lg flex items-center gap-2"><span className="bg-rose-400 text-white px-2 py-0.5 rounded-lg text-sm">{viewingVoters.candidateSeatNo}</span> {viewingVoters.candidateName}</h3><button onClick={() => setViewingVoters(null)}><X size={20}/></button></div>
+                   <div className="bg-slate-50 px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+                      <h3 className="font-bold text-slate-700 text-lg flex items-center gap-2"><span className="bg-rose-400 text-white px-2 py-0.5 rounded-lg text-sm">{viewingVoters.candidateSeatNo}</span> {viewingVoters.candidateName}</h3>
+                      <button onClick={() => setViewingVoters(null)}><X size={20}/></button>
+                   </div>
                    <div className="p-6 overflow-y-auto flex-1 space-y-6">
                       <div>
                         <h4 className="text-sm font-bold text-indigo-500 mb-3 border-b border-indigo-100 pb-1">該生的志願序</h4>
-                        <div className="flex flex-wrap gap-2">{viewingVoters.ownChoices && viewingVoters.ownChoices.map((code, idx) => (<div key={idx} className="flex items-center bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-1.5"><span className="text-indigo-300 text-xs font-bold mr-2">{idx+1}.</span><span className="text-indigo-800 text-sm font-bold">{POSITION_MAP[code]}</span></div>))}</div>
+                        <div className="flex flex-wrap gap-2">
+                           {viewingVoters.ownChoices && viewingVoters.ownChoices.map((code, idx) => (
+                              <div key={idx} className="flex items-center bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-1.5"><span className="text-indigo-300 text-xs font-bold mr-2">{idx+1}.</span><span className="text-indigo-800 text-sm font-bold">{POSITION_MAP[code]}</span></div>
+                           ))}
+                        </div>
                       </div>
                       <div>
                         <h4 className="text-sm font-bold text-teal-500 mb-3 border-b border-teal-100 pb-1">支持者名單</h4>
-                        <div className="flex flex-wrap gap-2">{viewingVoters.voters && viewingVoters.voters.map((seat, idx) => (<span key={idx} className="bg-teal-50 text-teal-600 border border-teal-100 px-3 py-1.5 rounded-xl text-sm font-bold">{getStudentNameLabel(seat)}</span>))}</div>
+                        <div className="flex flex-wrap gap-2">
+                           {viewingVoters.voters && viewingVoters.voters.map((seat, idx) => (
+                              <span key={idx} className="bg-teal-50 text-teal-600 border border-teal-100 px-3 py-1.5 rounded-xl text-sm font-bold">{getStudentNameLabel(seat)}</span>
+                           ))}
+                        </div>
                       </div>
                    </div>
                 </div>
@@ -936,6 +1224,7 @@ const App = () => {
 
           {showPasswordModal && (
             <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+               {/* ... Password Modal ... */}
                <div className="bg-white rounded-3xl shadow-2xl max-w-sm w-full border-4 border-indigo-100 p-8 flex flex-col items-center">
                   <h3 className="text-xl font-bold text-slate-700 mb-2">請輸入管理密碼</h3>
                   <p className="text-slate-400 text-sm mb-4 text-center">請回答下列單字的英文</p>
@@ -951,6 +1240,7 @@ const App = () => {
 
           {showMapModal && (
              <div className="fixed inset-0 bg-indigo-900/20 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                {/* ... Map Modal ... */}
                 <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full border-4 border-indigo-50 flex flex-col max-h-[85vh]">
                    <div className="bg-indigo-50 px-6 py-4 border-b border-indigo-100 flex items-center justify-between"><h3 className="font-bold text-indigo-800 text-lg">職位代碼表</h3><button onClick={() => setShowMapModal(false)}><X size={20}/></button></div>
                    <div className="p-6 overflow-y-auto"><div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">{Object.entries(POSITION_MAP).map(([code, name]) => <div key={code} className="flex items-center gap-3 p-3 rounded-2xl border-2 border-slate-50 bg-white"><span className="bg-indigo-100 text-indigo-600 text-sm font-bold w-8 h-8 flex items-center justify-center rounded-xl">{code}</span><span className="text-slate-600 font-bold text-sm">{name}</span></div>)}</div></div>
@@ -1115,45 +1405,31 @@ const App = () => {
             );
             })}
           </div>
-
+          
           {viewMode === 'teacher' && (
               <div className="mt-8 animate-in fade-in slide-in-from-top-4">
-                <div className="bg-white/80 border-2 border-slate-200 rounded-3xl p-6 shadow-sm overflow-hidden relative">
-                  <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-slate-600 font-bold flex items-center gap-2 text-lg">
-                       <div className="bg-slate-100 p-1.5 rounded-full"><Activity className="text-slate-500" size={20} /></div>
-                       學生登入記錄 (最近 40 筆)
-                    </h2>
-                    <button 
-                      onClick={handleClearAllLogs}
-                      className="bg-rose-100 text-rose-500 p-2 rounded-xl hover:bg-rose-200 hover:text-rose-600 transition-colors"
-                      title="清除所有紀錄"
-                    >
-                      <Trash2 size={18} />
-                    </button>
-                  </div>
+                <div className="bg-white/80 border-2 border-slate-200 rounded-3xl p-6 shadow-sm overflow-hidden">
+                  <h2 className="text-slate-600 font-bold flex items-center gap-2 text-lg mb-4">
+                     <div className="bg-slate-100 p-1.5 rounded-full"><Activity className="text-slate-500" size={20} /></div>
+                     學生登入記錄 (最近 40 筆)
+                  </h2>
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm text-left text-slate-600">
                       <thead className="text-xs text-slate-400 uppercase bg-slate-50">
                         <tr>
-                          <th className="px-6 py-3 rounded-l-xl w-16 text-center">#</th>
-                          <th className="px-6 py-3 w-40">時間</th>
+                          <th className="px-6 py-3 rounded-l-xl">時間</th>
                           <th className="px-6 py-3">座號 / 姓名</th>
-                          <th className="px-6 py-3">裝置 (IP)</th>
+                          <th className="px-6 py-3">IP 位址</th>
                           <th className="px-6 py-3 rounded-r-xl">訊息</th>
                         </tr>
                       </thead>
                       <tbody>
                         {loginLogs.length > 0 ? (
-                          loginLogs.map((log, index) => (
+                          loginLogs.map((log) => (
                             <tr key={log.id} className="bg-white border-b border-slate-50 hover:bg-slate-50 transition-colors">
-                              <td className="px-6 py-4 font-mono text-center text-slate-400">{index + 1}</td>
-                              <td className="px-6 py-4 font-mono whitespace-nowrap">{log.timestamp ? new Date(log.timestamp.seconds * 1000).toLocaleString('zh-TW', { hour12: false }) : 'Updating...'}</td>
+                              <td className="px-6 py-4 font-mono">{log.timestamp ? new Date(log.timestamp.seconds * 1000).toLocaleString() : 'Updating...'}</td>
                               <td className="px-6 py-4 font-bold text-indigo-600">{log.seatNo} {log.name}</td>
-                              <td className="px-6 py-4 font-mono text-slate-500 text-xs">
-                                <div>{log.ip}</div>
-                                <div className="text-slate-400 scale-90 origin-left">{log.device}</div>
-                              </td>
+                              <td className="px-6 py-4 font-mono text-slate-500">{log.ip}</td>
                               <td className="px-6 py-4">
                                 <span className={`px-2 py-1 rounded-lg text-xs font-bold ${log.message.includes('強制') ? 'bg-rose-100 text-rose-600' : (log.message.includes('完成') ? 'bg-teal-100 text-teal-600' : 'bg-slate-100 text-slate-600')}`}>
                                   {log.message}
@@ -1162,7 +1438,7 @@ const App = () => {
                             </tr>
                           ))
                         ) : (
-                          <tr><td colSpan="5" className="px-6 py-8 text-center text-slate-400 italic">尚無紀錄</td></tr>
+                          <tr><td colSpan="4" className="px-6 py-8 text-center text-slate-400 italic">尚無紀錄</td></tr>
                         )}
                       </tbody>
                     </table>
